@@ -17,17 +17,19 @@
 #include <linux/vmalloc.h>
 
 #include "ion_page_pool.h"
+#include "../ion_bltin.h"
 
 #define NUM_ORDERS ARRAY_SIZE(orders)
 
 static gfp_t high_order_gfp_flags = (GFP_HIGHUSER | __GFP_ZERO | __GFP_NOWARN |
 				     __GFP_NORETRY) & ~__GFP_RECLAIM;
 static gfp_t low_order_gfp_flags  = GFP_HIGHUSER | __GFP_ZERO;
+
 #ifdef CONFIG_HUGEPAGE_POOL
 #include <linux/hugepage_pool.h>
-static const unsigned int orders[] = {HUGEPAGE_ORDER, 4, 0};
+static const unsigned int orders[] = {HUGEPAGE_ORDER, 8, 4, 0};
 #else
-static const unsigned int orders[] = {8, 4, 0};
+static const unsigned int orders[] = {9, 8, 4, 0};
 #endif
 
 static int order_to_index(unsigned int order)
@@ -47,9 +49,12 @@ static inline unsigned int order_to_size(int order)
 }
 
 struct ion_system_heap {
-	struct ion_heap heap;
+	struct ion_bltin_heap bltin_heap;
 	struct ion_page_pool *pools[NUM_ORDERS];
 };
+
+#define to_system_heap(x) (container_of(to_bltin_heap(x), \
+			struct ion_system_heap, bltin_heap))
 
 static struct page *alloc_buffer_page(struct ion_system_heap *heap,
 				      struct ion_buffer *buffer,
@@ -111,9 +116,7 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 				    unsigned long size,
 				    unsigned long flags)
 {
-	struct ion_system_heap *sys_heap = container_of(heap,
-							struct ion_system_heap,
-							heap);
+	struct ion_system_heap *sys_heap = to_system_heap(heap);
 	struct sg_table *table;
 	struct scatterlist *sg;
 	struct list_head pages;
@@ -121,6 +124,8 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 	int i = 0;
 	unsigned long size_remaining = PAGE_ALIGN(size);
 	unsigned int max_order = orders[0];
+
+	ion_bltin_event_begin();
 
 	if (size / PAGE_SIZE > totalram_pages() / 2)
 		return -ENOMEM;
@@ -154,6 +159,9 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 
 	ion_buffer_prep_noncached(buffer);
 
+	ion_add_bltin_buffer(&sys_heap->bltin_heap, buffer);
+	ion_bltin_event_record(ION_BLTIN_EVENT_ALLOC, buffer, begin);
+
 	return 0;
 
 free_table:
@@ -166,12 +174,12 @@ free_pages:
 
 static void ion_system_heap_free(struct ion_buffer *buffer)
 {
-	struct ion_system_heap *sys_heap = container_of(buffer->heap,
-							struct ion_system_heap,
-							heap);
+	struct ion_system_heap *sys_heap = to_system_heap(buffer->heap);
 	struct sg_table *table = buffer->sg_table;
 	struct scatterlist *sg;
 	int i;
+
+	ion_bltin_event_begin();
 
 	/* zero the buffer before goto page pool */
 	if (!(buffer->private_flags & ION_PRIV_FLAG_SHRINKER_FREE))
@@ -181,6 +189,8 @@ static void ion_system_heap_free(struct ion_buffer *buffer)
 		free_buffer_page(sys_heap, buffer, sg_page(sg));
 	sg_free_table(table);
 	kfree(table);
+
+	ion_bltin_event_record(ION_BLTIN_EVENT_FREE, buffer, begin);
 }
 
 static int ion_system_heap_shrink(struct ion_heap *heap, gfp_t gfp_mask,
@@ -192,7 +202,7 @@ static int ion_system_heap_shrink(struct ion_heap *heap, gfp_t gfp_mask,
 	int i, nr_freed;
 	int only_scan = 0;
 
-	sys_heap = container_of(heap, struct ion_system_heap, heap);
+	sys_heap = to_system_heap(heap);
 
 	if (!nr_to_scan)
 		only_scan = 1;
@@ -220,11 +230,10 @@ static int ion_system_heap_shrink(struct ion_heap *heap, gfp_t gfp_mask,
 
 static long ion_system_get_pool_size(struct ion_heap *heap)
 {
-	struct ion_system_heap *sys_heap;
+	struct ion_system_heap *sys_heap = to_system_heap(heap);
 	long total_pages = 0;
 	int i;
 
-	sys_heap = container_of(heap, struct ion_system_heap, heap);
 	for (i = 0; i < NUM_ORDERS; i++)
 		total_pages += ion_page_pool_nr_pages(sys_heap->pools[i]);
 
@@ -248,15 +257,7 @@ static int ion_system_heap_create_pools(struct ion_page_pool **pools)
 		struct ion_page_pool *pool;
 		gfp_t gfp_flags = low_order_gfp_flags;
 
-		/*
-		 * Enable NOWARN on larger order allocations, as
-		 * we will fall back to 0-order if things fail.
-		 * This avoids warning noise in dmesg.
-		 */
 		if (orders[i] > 0)
-			gfp_flags |= __GFP_NOWARN;
-
-		if (orders[i] > 4)
 			gfp_flags = high_order_gfp_flags;
 
 		pool = ion_page_pool_create(gfp_flags, orders[i]);
@@ -280,29 +281,58 @@ static struct ion_heap_ops system_heap_ops = {
 };
 
 static struct ion_system_heap system_heap = {
-	.heap = {
-		.ops = &system_heap_ops,
-		.type = ION_HEAP_TYPE_SYSTEM,
-		.flags = ION_HEAP_FLAG_DEFER_FREE,
-		.name = "ion_system_heap",
+	.bltin_heap = {
+			.heap = {
+				.ops = &system_heap_ops,
+				.type = ION_HEAP_TYPE_SYSTEM,
+				.flags = ION_HEAP_FLAG_DEFER_FREE,
+				.name = "ion_system_heap",
+			}
 	}
 };
 
 static int __init ion_system_heap_init(void)
 {
-	int ret = ion_system_heap_create_pools(system_heap.pools);
-	if (ret)
+	struct device *dev;
+	int ret = -ENOMEM;
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
 		return ret;
 
-	return ion_device_add_heap(&system_heap.heap);
+	device_initialize(dev);
+	arch_setup_dma_ops(dev, 0x0ULL, 1ULL << 36, NULL, false);
+	dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(36));
+
+	system_heap.bltin_heap.dev = dev;
+
+	ret = ion_system_heap_create_pools(system_heap.pools);
+	if (ret)
+		goto err_system_pool;
+
+	ret = ion_device_add_heap(&system_heap.bltin_heap.heap);
+	if (ret)
+		goto err_add_heap;
+
+	ion_bltin_heap_init(&system_heap.bltin_heap);
+
+	return 0;
+
+err_add_heap:
+	ion_system_heap_destroy_pools(system_heap.pools);
+err_system_pool:
+	kfree(dev);
+
+	return ret;
 }
 
 static void __exit ion_system_heap_exit(void)
 {
-	ion_device_remove_heap(&system_heap.heap);
+	ion_device_remove_heap(&system_heap.bltin_heap.heap);
 	ion_system_heap_destroy_pools(system_heap.pools);
+	kfree(system_heap.bltin_heap.dev);
 }
 
-subsys_initcall(ion_system_heap_init);
+module_init(ion_system_heap_init);
 module_exit(ion_system_heap_exit);
 MODULE_LICENSE("GPL v2");
