@@ -1311,7 +1311,6 @@ out:
 		if (!ext4_has_feature_verity(sb))
 			return -EOPNOTSUPP;
 		return fsverity_ioctl_measure(filp, (void __user *)arg);
-
 	default:
 		return -ENOTTY;
 	}

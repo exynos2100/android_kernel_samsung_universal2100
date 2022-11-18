@@ -387,7 +387,10 @@ static int io_submit_add_bh(struct ext4_io_submit *io,
 	if (io->io_bio && (bh->b_blocknr != io->io_next_block ||
 			   !fscrypt_mergeable_bio_bh(io->io_bio, bh))) {
 submit_and_retry:
-		ext4_io_submit(io);
+// CONFIG_DDAR [
+		if (ext4_io_submit_to_dd(inode, io) == -EOPNOTSUPP)
+			ext4_io_submit(io);
+// ] CONFIG_DDAR
 	}
 	if (io->io_bio == NULL) {
 		ret = io_submit_init_bio(io, bh);
@@ -458,7 +461,10 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 			if (!buffer_mapped(bh))
 				clear_buffer_dirty(bh);
 			if (io->io_bio)
-				ext4_io_submit(io);
+// CONFIG_DDAR [
+				if (ext4_io_submit_to_dd(inode, io) == -EOPNOTSUPP)
+					ext4_io_submit(io);
+// ] CONFIG_DDAR
 			continue;
 		}
 		if (buffer_new(bh))
@@ -495,10 +501,14 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
 			if (ret == -ENOMEM &&
 			    (io->io_bio || wbc->sync_mode == WB_SYNC_ALL)) {
 				gfp_flags = GFP_NOFS;
-				if (io->io_bio)
-					ext4_io_submit(io);
-				else
+				if (io->io_bio) {
+// CONFIG_DDAR [
+					if (ext4_io_submit_to_dd(inode, io) == -EOPNOTSUPP)
+						ext4_io_submit(io);
+// ] CONFIG_DDAR
+				} else {
 					gfp_flags |= __GFP_NOFAIL;
+				}
 				congestion_wait(BLK_RW_ASYNC, HZ/50);
 				goto retry_encrypt;
 			}
